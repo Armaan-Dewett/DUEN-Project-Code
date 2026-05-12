@@ -7,6 +7,7 @@ import subprocess
 import cv2
 import numpy as np
 import imutils
+import qrcode
 from picamera2 import Picamera2
 from datetime import datetime
 from gpiozero import Button
@@ -61,6 +62,32 @@ ANGLES_TO_CAPTURE = [270, 245, 220, 195, 170, 145, 120, 95, 70, 45, 20, 0]
 MIN_PULSE = 500
 MAX_PULSE = 2500
 MAX_DEGREES = 270
+
+# ============================================================
+# PRINT / QR CONFIGURATION
+# ============================================================
+
+PRINTER_WIDTH_PX = 384  # Thermal printer paper width in pixels at 203 DPI
+
+# 8mm spacing between photo and QR at 203 DPI:
+# 203 DPI / 25.4 mm/inch = 7.99 px/mm → 8mm ≈ 64 px
+QR_GAP_PX = 64
+
+# QR code target width (centered within PRINTER_WIDTH_PX)
+QR_TARGET_WIDTH = 260
+
+# URL to encode in the QR code.
+# Replace this with your Google Drive share link, a custom URL, etc.
+# If left empty (""), the QR code is skipped entirely.
+QR_URL = ""   # ← FILL IN YOUR URL HERE
+
+# DUEN logo settings — printed at the very bottom of every receipt.
+# Drop a PNG (transparent background OK, but black-on-white prints best on
+# thermal paper) at LOGO_PATH. If the file is missing, the logo is silently
+# skipped and the rest of the print still works.
+LOGO_PATH        = os.path.expanduser("~/duen/duen_logo.png")
+LOGO_TARGET_WIDTH = 240   # px — scale logo to this width, preserving aspect ratio
+LOGO_GAP_PX       = 64    # 8mm gap above the logo (matches QR spacing)
 
 # ============================================================
 # SETUP
@@ -201,10 +228,119 @@ def stitch_images():
 
 
 # ============================================================
+# PRINT COMPOSITING HELPERS
+# ============================================================
+
+def make_qr_image(url, target_width=QR_TARGET_WIDTH):
+    """
+    Generates a QR code for `url` and returns it as a grayscale PIL Image
+    scaled to target_width pixels square (centered later when composited).
+    """
+    qr = qrcode.QRCode(
+        version=None,           # auto-size
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("L")
+    qr_img = qr_img.resize((target_width, target_width), Image.LANCZOS)
+    return qr_img
+
+
+def load_logo_image(path=LOGO_PATH, target_width=LOGO_TARGET_WIDTH, threshold=200):
+    """
+    Loads the DUEN logo from disk and prepares it for thermal printing:
+        1. Composites onto a white background (handles transparent PNGs).
+        2. Converts to grayscale.
+        3. Thresholds to pure black/white — anything darker than `threshold`
+           becomes solid black, everything else white. This makes the gold
+           DUEN logo print as a clean silhouette instead of a faded gray blob.
+        4. Scales to target_width preserving aspect ratio.
+
+    Returns None if the file is missing or cannot be read; composite_print_image
+    silently skips the logo block in that case.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        raw = Image.open(path)
+
+        # Flatten transparency onto white so transparent pixels don't darken
+        if raw.mode in ("RGBA", "LA") or (raw.mode == "P" and "transparency" in raw.info):
+            bg = Image.new("RGB", raw.size, (255, 255, 255))
+            rgba = raw.convert("RGBA")
+            bg.paste(rgba, mask=rgba.split()[-1])
+            raw = bg
+
+        gray = raw.convert("L")
+
+        # Pure-black/pure-white threshold — best for thermal output
+        bw = gray.point(lambda px: 0 if px < threshold else 255, mode="L")
+
+        ratio = target_width / bw.width
+        new_size = (target_width, int(bw.height * ratio))
+        return bw.resize(new_size, Image.LANCZOS)
+    except Exception as e:
+        print(f"Could not load logo at {path}: {e}")
+        return None
+
+
+def composite_print_image(photo_img, qr_url=None):
+    """
+    Takes a print-ready grayscale photo PIL Image (already 384px wide) and
+    returns a new PIL Image stacked as:
+        [photo]
+        [8mm gap]
+        [dashed line]
+        [8mm gap]
+        [QR code, centred]   ← only if qr_url provided
+        [8mm gap]
+        [DUEN logo, centred] ← only if LOGO_PATH file exists
+    The QR and logo blocks are independent — either, both, or neither may be
+    appended depending on what's available.
+    """
+    blocks = []   # list of PIL Images stacked top-to-bottom
+
+    # Always start with the photo
+    blocks.append(photo_img)
+
+    gap_qr   = Image.new("L", (PRINTER_WIDTH_PX, QR_GAP_PX),   color=255)
+    gap_logo = Image.new("L", (PRINTER_WIDTH_PX, LOGO_GAP_PX), color=255)
+
+    # ── QR section ──
+    if qr_url:
+        qr_img = make_qr_image(qr_url)
+        qr_canvas = Image.new("L", (PRINTER_WIDTH_PX, qr_img.height), color=255)
+        qr_canvas.paste(qr_img, ((PRINTER_WIDTH_PX - qr_img.width) // 2, 0))
+        blocks += [gap_qr, qr_canvas]
+
+    # ── Logo section ──
+    logo = load_logo_image()
+    if logo is not None:
+        logo_canvas = Image.new("L", (PRINTER_WIDTH_PX, logo.height), color=255)
+        logo_canvas.paste(logo, ((PRINTER_WIDTH_PX - logo.width) // 2, 0))
+        blocks += [gap_logo, logo_canvas]
+
+    # Nothing extra to stack — return photo unchanged
+    if len(blocks) == 1:
+        return photo_img
+
+    total_height = sum(b.height for b in blocks)
+    combined = Image.new("L", (PRINTER_WIDTH_PX, total_height), color=255)
+    y = 0
+    for b in blocks:
+        combined.paste(b, (0, y))
+        y += b.height
+    return combined
+
+
+# ============================================================
 # THERMAL PRINTING
 # ============================================================
 
-def process_and_print(filepath):
+def process_and_print(filepath, qr_url=QR_URL):
     img = Image.open(filepath)
 
     # Strip EXIF orientation
@@ -241,11 +377,14 @@ def process_and_print(filepath):
     # Rotate for landscape printing
     img = img.rotate(90, expand=True)
 
-    # Resize to 384px wide
-    width = 384
+    # Resize to printer width
+    width = PRINTER_WIDTH_PX
     ratio = width / img.width
     height = int(img.height * ratio)
     img = img.resize((width, height), Image.LANCZOS)
+
+    # Composite QR below the photo (no-op if QR_URL is empty)
+    img = composite_print_image(img, qr_url)
 
     # Save print-ready copy
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -340,5 +479,3 @@ except KeyboardInterrupt:
     camera.stop()
     pi.set_servo_pulsewidth(SERVO_PIN, 0)
     pi.stop()
-
-
