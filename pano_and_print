@@ -1,0 +1,344 @@
+import pigpio
+import time
+import os
+import shutil
+import glob
+import subprocess
+import cv2
+import numpy as np
+import imutils
+from picamera2 import Picamera2
+from datetime import datetime
+from gpiozero import Button
+from escpos.printer import Usb
+from PIL import Image, ImageEnhance, ExifTags
+
+# ============================================================
+# PIN CONFIGURATION
+# ============================================================
+
+SERVO_PIN = 26          # GPIO pin for servo motor (updated from 17)
+BUTTON_PIN = 17         # GPIO pin for the trigger button
+
+# ============================================================
+# FOLDER CONFIGURATION
+# ============================================================
+
+SAVE_DIR = os.path.expanduser("~/photos")
+IMAGE_FOLDER = "imageprinter"
+UNSTITCHED_FOLDER = os.path.join(IMAGE_FOLDER, "unstitchedImages")
+STITCHED_OUTPUT = os.path.join(IMAGE_FOLDER, "stitchedOutputProcessed.png")
+RAW_STITCHED_OUTPUT = os.path.join(IMAGE_FOLDER, "stitchedOutputRaw.png")
+STITCH_RESIZE_WIDTH = 1200
+
+# ============================================================
+# SPEED + SHARPNESS SETTINGS
+# ============================================================
+
+# Lower = faster, but more chance of servo shake blur.
+# Good range: 0.22 to 0.40
+FAST_SERVO_WAIT = 0.28
+
+# Lower exposure = less motion blur.
+# 3000 us = 1/333 second
+# If image is too dark, add more light first.
+# Try 2000, 3000, 4000, or 5000.
+EXPOSURE_TIME_US = 8000
+
+# Higher gain brightens the image but adds noise.
+# Try 4.0 to 8.0.
+ANALOGUE_GAIN = 8.0
+
+# Smaller image = faster capture and usually easier stitching.
+# For max quality use 3280x2464.
+# For faster, use 1920x1080 or 1640x1232.
+IMAGE_WIDTH = 1920
+IMAGE_HEIGHT = 1920
+
+# Angles to capture
+ANGLES_TO_CAPTURE = [270, 245, 220, 195, 170, 145, 120, 95, 70, 45, 20, 0]
+
+MIN_PULSE = 500
+MAX_PULSE = 2500
+MAX_DEGREES = 270
+
+# ============================================================
+# SETUP
+# ============================================================
+
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+pi = pigpio.pi()
+if not pi.connected:
+    raise RuntimeError("Could not connect to pigpiod. Run: sudo pigpiod")
+
+button = Button(BUTTON_PIN, pull_up=True, bounce_time=0.05)
+
+camera = Picamera2()
+config = camera.create_still_configuration(
+    main={"size": (IMAGE_WIDTH, IMAGE_HEIGHT)}
+)
+camera.configure(config)
+camera.start()
+time.sleep(2)
+print("Panorama photo booth ready! Press the button to start.")
+
+# ============================================================
+# SERVO HELPERS
+# ============================================================
+
+def angle_to_pulse(angle):
+    angle = max(0, min(MAX_DEGREES, angle))
+    pulse = MIN_PULSE + (angle / MAX_DEGREES) * (MAX_PULSE - MIN_PULSE)
+    return int(pulse)
+
+
+def move_servo(angle):
+    pulse = angle_to_pulse(angle)
+    print(f"Moving to {angle} degrees, pulsewidth {pulse}")
+    pi.set_servo_pulsewidth(SERVO_PIN, pulse)
+
+
+# ============================================================
+# IMAGE CAPTURE
+# ============================================================
+
+def setup_image_folders():
+    if os.path.exists(IMAGE_FOLDER):
+        shutil.rmtree(IMAGE_FOLDER)
+    os.makedirs(UNSTITCHED_FOLDER)
+
+
+def take_picture(angle, index):
+    filename = os.path.join(UNSTITCHED_FOLDER, f"{index:02d}_angle_{angle:03d}.jpg")
+    print(f"Taking picture: {filename}")
+    camera.capture_file(filename)
+    time.sleep(0.05)
+    return filename
+
+
+# ============================================================
+# PANORAMA STITCHING
+# ============================================================
+
+def extract_capture_index(path):
+    filename = os.path.basename(path)
+    return int(filename.split("_")[0])
+
+
+def crop_only_outer_black(stitched_img):
+    """
+    Keeps all real panorama content.
+    Only removes empty black border around the outside.
+    """
+    gray = cv2.cvtColor(stitched_img, cv2.COLOR_BGR2GRAY)
+    ys, xs = np.where(gray > 0)
+
+    if len(xs) == 0 or len(ys) == 0:
+        print("No visible pixels found. Saving raw stitched image.")
+        return stitched_img
+
+    x1 = np.min(xs)
+    x2 = np.max(xs)
+    y1 = np.min(ys)
+    y2 = np.max(ys)
+
+    return stitched_img[y1:y2 + 1, x1:x2 + 1]
+
+
+def stitch_images():
+    image_paths = sorted(
+        glob.glob(os.path.join(UNSTITCHED_FOLDER, "*.jpg")),
+        key=extract_capture_index
+    )
+
+    images = []
+    print("Images being stitched:")
+    for image_path in image_paths:
+        print(image_path)
+        img = cv2.imread(image_path)
+        if img is None:
+            print("Could not read:", image_path)
+            continue
+        img_stitch = imutils.resize(img, width=STITCH_RESIZE_WIDTH)
+        images.append(img_stitch)
+
+    print(f"Loaded {len(images)} images for stitching")
+
+    if len(images) < 2:
+        raise ValueError("Need at least 2 images to stitch.")
+
+    imageStitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+    status, stitched_img = imageStitcher.stitch(images)
+
+    if status == cv2.Stitcher_OK:
+        print("Stitching complete.")
+
+        # Save raw stitch first so you can check whether the ends are actually there.
+        cv2.imwrite(RAW_STITCHED_OUTPUT, stitched_img)
+        print(f"Saved raw stitched image to: {RAW_STITCHED_OUTPUT}")
+
+        # Add small black border, then crop only the outside empty area.
+        stitched_img = cv2.copyMakeBorder(
+            stitched_img, 10, 10, 10, 10,
+            cv2.BORDER_CONSTANT, (0, 0, 0)
+        )
+
+        cleaned_img = crop_only_outer_black(stitched_img)
+        cv2.imwrite(STITCHED_OUTPUT, cleaned_img)
+        print(f"Saved final stitched image to: {STITCHED_OUTPUT}")
+        return True
+
+    else:
+        print("Stitching failed. Status code:", status)
+        if status == cv2.Stitcher_ERR_NEED_MORE_IMGS:
+            print("Reason: Need more images or not enough matching features.")
+        elif status == cv2.Stitcher_ERR_HOMOGRAPHY_EST_FAIL:
+            print("Reason: Homography estimation failed.")
+        elif status == cv2.Stitcher_ERR_CAMERA_PARAMS_ADJUST_FAIL:
+            print("Reason: Camera parameter adjustment failed.")
+        return False
+
+
+# ============================================================
+# THERMAL PRINTING
+# ============================================================
+
+def process_and_print(filepath):
+    img = Image.open(filepath)
+
+    # Strip EXIF orientation
+    try:
+        exif = img._getexif()
+        if exif:
+            for tag, value in exif.items():
+                if ExifTags.TAGS.get(tag) == 'Orientation':
+                    if value == 3:
+                        img = img.rotate(180, expand=True)
+                    elif value == 6:
+                        img = img.rotate(270, expand=True)
+                    elif value == 8:
+                        img = img.rotate(90, expand=True)
+                    break
+    except Exception:
+        pass
+
+    # Convert to grayscale
+    img = img.convert("L")
+
+    # Brightness
+    enhancer = ImageEnhance.Brightness(img)
+    img = enhancer.enhance(1.0)
+
+    # Contrast
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(1.5)
+
+    # Sharpness
+    enhancer = ImageEnhance.Sharpness(img)
+    img = enhancer.enhance(1.5)
+
+    # Rotate for landscape printing
+    img = img.rotate(90, expand=True)
+
+    # Resize to 384px wide
+    width = 384
+    ratio = width / img.width
+    height = int(img.height * ratio)
+    img = img.resize((width, height), Image.LANCZOS)
+
+    # Save print-ready copy
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    temp_path = os.path.join(SAVE_DIR, f"panorama_{timestamp}.png")
+    img.save(temp_path)
+    print(f"Print-ready image size: {img.size}, saved to: {temp_path}")
+
+    # Send to printer
+    try:
+        p = Usb(0x0485, 0x5741)
+        p.hw('INIT')
+        p.image(temp_path)
+        p.text("\n")
+        p.cut()
+        print("Panorama printed successfully!")
+    except Exception as e:
+        print(f"Print failed: {e}")
+
+
+# ============================================================
+# MAIN FLOW — triggered by button press
+# ============================================================
+
+# Guard against double-triggers while a shot is in progress
+is_running = False
+
+
+def run_panorama_and_print():
+    global is_running
+
+    if is_running:
+        print("Already running — ignoring button press.")
+        return
+
+    is_running = True
+    print("\n--- Button pressed! Starting panorama capture ---")
+
+    try:
+        setup_image_folders()
+
+        # Apply manual exposure settings
+        camera.set_controls({
+            "AeEnable": False,
+            "ExposureTime": EXPOSURE_TIME_US,
+            "AnalogueGain": ANALOGUE_GAIN,
+            "AwbEnable": True
+        })
+        time.sleep(0.3)  # Let settings apply
+
+        # Sweep and capture
+        for index, angle in enumerate(ANGLES_TO_CAPTURE):
+            move_servo(angle)
+            time.sleep(FAST_SERVO_WAIT)
+            take_picture(angle, index)
+
+        # Flush images to disk
+        print("Flushing image files to disk...")
+        subprocess.run(["sync"])
+
+        # Return servo to center
+        move_servo(135)
+        print("Servo returned to center (135 degrees)")
+
+        # Stitch panorama
+        success = stitch_images()
+
+        # Print result
+        if success and os.path.exists(STITCHED_OUTPUT):
+            process_and_print(STITCHED_OUTPUT)
+        else:
+            print("Skipping print — stitching did not produce a valid output.")
+
+    except Exception as e:
+        print(f"Error during panorama capture: {e}")
+
+    finally:
+        is_running = False
+        print("--- Ready for next shot ---\n")
+
+
+button.when_pressed = run_panorama_and_print
+
+# ============================================================
+# KEEP ALIVE
+# ============================================================
+
+try:
+    while True:
+        time.sleep(0.1)
+except KeyboardInterrupt:
+    print("\nShutting down.")
+    camera.stop()
+    pi.set_servo_pulsewidth(SERVO_PIN, 0)
+    pi.stop()
+
+
