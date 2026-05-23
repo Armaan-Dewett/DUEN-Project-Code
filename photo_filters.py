@@ -131,25 +131,30 @@ COMIC_PARAMS = {
 
 # ── Pixel / retro ─────────────────────────────────────────────────────────────
 PIXEL_PARAMS = {
-    "block_size":        3,     # smaller blocks = clearer faces
-    "palette_levels":    12,    # enough colors to keep skin/clothes readable
-    "scanline_every":    3,     # subtle CRT effect
-    "scanline_alpha":    16,    # light scanlines only
-    "vignette_strength": 0.0,   # no darkened corners/background
-    "contrast":          1.14,
-    "saturation":        1.18,
-    "sharpness":         1.28,
-    "process_max_px":    0,     # don't shrink before processing
+    # Tuned for black-and-white thermal printing.
+    # Big blocks + limited gray levels survive the 384px receipt width.
+    "block_size":        7,
+    "gray_levels":       5,
+    "scanline_every":    4,
+    "scanline_alpha":    55,
+    "dot_grid_every":    10,
+    "dot_grid_radius":   1,
+    "border_px":         10,
+    "contrast":          1.45,
+    "brightness":        1.04,
+    "sharpness":         1.65,
 }
 # ── Pencil sketch ─────────────────────────────────────────────────────────────
 SKETCH_PARAMS = {
-    "blur_ksize":      23,   # a bit stronger sketch shading
-    "detail_blend":    0.26, # enough face detail, but less than before
-    "contrast":        1.58,
-    "brightness":      1.08,
-    "sharpness":       1.48,
-    "edge_strength":   0.38, # stronger sketch lines, but not overpowering
-    "threshold":       0,
+    # Tuned for black-and-white thermal printing.
+    "blur_ksize":        31,
+    "detail_blend":      0.12,
+    "contrast":          1.95,
+    "brightness":        1.12,
+    "sharpness":         1.85,
+    "edge_strength":     0.68,
+    "paper_texture":     18,
+    "threshold":         0,
 }
 
 
@@ -450,169 +455,168 @@ def apply_comic_filter(pil_img, params=None):
 
 def apply_pixel_filter(pil_img, params=None):
     """
-    Retro / 90s game pixel filter with clearer faces.
+    Black-and-white retro filter tuned for thermal receipt printing.
 
-
-    Goals:
-    - obvious pixelated / retro style
-    - faces still relatively clear
-    - subtle CRT vibe
-    - no blackened background
+    It avoids relying on color because the printer is black and white.
+    The style is forced through chunky pixels, gray posterization,
+    visible scanlines, dot texture, and a bold border.
     """
     p = {**PIXEL_PARAMS, **(params or {})}
-    src = pil_img.convert("RGB")
+    src = pil_img.convert("L")
     W, H = src.size
 
+    block = max(1, int(p["block_size"]))
 
-    block = max(1, p["block_size"])
-
-
-    # Downscale gently so it looks pixelated but still readable
+    # 1. Hard pixelation.
     small_w = max(1, W // block)
     small_h = max(1, H // block)
     small = src.resize((small_w, small_h), Image.BOX)
-
-
-    # Reduce colors for retro feel, but keep enough tones for faces
-    if _HAVE_CV2:
-        arr = np.array(small)
-        arr = _quantise_np(arr, p["palette_levels"])
-        small = Image.fromarray(arr)
-    else:
-        small = _quantise_pil(small, p["palette_levels"])
-
-
-    # Upscale with sharp pixel edges
     pixelated = small.resize((W, H), Image.NEAREST)
 
+    # 2. Posterize into a few gray levels.
+    levels = max(2, int(p["gray_levels"]))
 
-    # Light scanlines for 90s CRT feel
-    if p["scanline_every"] > 0 and p["scanline_alpha"] > 0:
-        alpha = p["scanline_alpha"]
-        scan_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    def quantize(v):
+        step = 255 / (levels - 1)
+        return int(round(v / step) * step)
+
+    pixelated = pixelated.point(quantize)
+
+    # 3. Strong scanlines.
+    scanline_every = int(p["scanline_every"])
+    scanline_alpha = int(p["scanline_alpha"])
+    if scanline_every > 0 and scanline_alpha > 0:
+        scan_layer = Image.new("L", (W, H), 255)
         sd = ImageDraw.Draw(scan_layer)
+        for y in range(0, H, scanline_every):
+            sd.line([(0, y), (W, y)], fill=max(0, 255 - scanline_alpha), width=1)
+        pixelated = Image.blend(pixelated, scan_layer, 0.35)
 
+    # 4. Dot grid texture, useful on thermal paper.
+    dot_every = int(p.get("dot_grid_every", 0))
+    dot_radius = int(p.get("dot_grid_radius", 1))
+    if dot_every > 0:
+        dot_layer = Image.new("L", (W, H), 255)
+        dd = ImageDraw.Draw(dot_layer)
+        for y in range(dot_every // 2, H, dot_every):
+            for x in range(dot_every // 2, W, dot_every):
+                dd.ellipse(
+                    [x - dot_radius, y - dot_radius, x + dot_radius, y + dot_radius],
+                    fill=70,
+                )
+        pixelated = Image.blend(pixelated, dot_layer, 0.18)
 
-        for y in range(0, H, p["scanline_every"]):
-            sd.line([(0, y), (W, y)], fill=(0, 0, 0, alpha))
-
-
-        pixelated = pixelated.convert("RGBA")
-        pixelated = Image.alpha_composite(pixelated, scan_layer).convert("RGB")
-
-
-    # No darkened background unless explicitly enabled
-    if p["vignette_strength"] > 0:
-        pixelated = _radial_vignette(pixelated, p["vignette_strength"])
-
-
-    # Mild enhancement to keep people readable
+    # 5. Thermal-printer enhancement.
     pixelated = ImageEnhance.Contrast(pixelated).enhance(p["contrast"])
-    pixelated = ImageEnhance.Color(pixelated).enhance(p["saturation"])
+    pixelated = ImageEnhance.Brightness(pixelated).enhance(p["brightness"])
     pixelated = ImageEnhance.Sharpness(pixelated).enhance(p["sharpness"])
 
+    # 6. Bold retro border.
+    border_px = int(p.get("border_px", 0))
+    if border_px > 0:
+        d = ImageDraw.Draw(pixelated)
+        for i in range(border_px):
+            shade = 0 if i < border_px // 2 else 80
+            d.rectangle([i, i, W - 1 - i, H - 1 - i], outline=shade)
 
-    return pixelated
+    return pixelated.convert("RGB")
+
+
 # =============================================================================
 # FILTER 4 — SKETCH FILTER
 # =============================================================================
 def apply_sketch_filter(pil_img, params=None):
     """
-    Pencil sketch filter tuned for a middle ground:
-    - clearly sketch-like
-    - still readable faces
-    - good for thermal printing
+    Strong pencil sketch filter tuned for black-and-white thermal printing.
+
+    It uses darker edges, less original-photo blending, paper texture,
+    and higher contrast so the print clearly looks sketched.
     """
     p = {**SKETCH_PARAMS, **(params or {})}
     src = pil_img.convert("RGB")
 
-
-    # Pillow-only fallback
+    # Pillow-only fallback.
     if not _HAVE_CV2:
-        gray = ImageEnhance.Color(src).enhance(0.0).convert("L")
-        gray = gray.filter(ImageFilter.EDGE_ENHANCE_MORE)
-        gray = ImageEnhance.Contrast(gray).enhance(p["contrast"])
-        gray = ImageEnhance.Brightness(gray).enhance(p["brightness"])
-        gray = ImageEnhance.Sharpness(gray).enhance(p["sharpness"])
-        return gray.convert("RGB")
+        gray = src.convert("L")
+        edges = gray.filter(ImageFilter.FIND_EDGES)
+        edges = ImageEnhance.Contrast(edges).enhance(2.2)
+        edges = ImageEnhance.Sharpness(edges).enhance(2.0)
+        edges = Image.eval(edges, lambda v: 255 - v)
+        edges = ImageEnhance.Contrast(edges).enhance(p["contrast"])
+        edges = ImageEnhance.Brightness(edges).enhance(p["brightness"])
+        return edges.convert("RGB")
 
-
-    # 1. Grayscale
+    # 1. Grayscale.
     gray = cv2.cvtColor(np.array(src), cv2.COLOR_RGB2GRAY)
 
+    # 2. Local contrast for faces, clothes, and background detail.
+    clahe = cv2.createCLAHE(clipLimit=2.6, tileGridSize=(8, 8))
+    gray_detail = clahe.apply(gray)
 
-    # 2. Gentle smoothing
-    gray_clean = cv2.bilateralFilter(gray, d=5, sigmaColor=40, sigmaSpace=40)
-
-
-    # 3. Local contrast boost for faces/features
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray_detail = clahe.apply(gray_clean)
-
-
-    # 4. Classic pencil sketch dodge blend
+    # 3. Pencil dodge blend.
     inv = 255 - gray_detail
-
-
     ksize = int(p["blur_ksize"])
     if ksize < 3:
         ksize = 3
     if ksize % 2 == 0:
         ksize += 1
 
-
     blur = cv2.GaussianBlur(inv, (ksize, ksize), 0)
-
-
     denom = 255 - blur
     denom[denom == 0] = 1
     sketch = cv2.divide(gray_detail, denom, scale=256)
 
+    # 4. Strong black pencil lines.
+    edges = cv2.Canny(gray_detail, 35, 115)
+    kernel = np.ones((2, 2), np.uint8)
+    edges = cv2.dilate(edges, kernel, iterations=1)
+    edge_layer = 255 - edges
 
-    # 5. Edge extraction for artistic sketch lines
-    edges = cv2.Canny(gray_detail, 55, 145)
-    edges = cv2.GaussianBlur(edges, (3, 3), 0)
-    edges = cv2.dilate(edges, np.ones((1, 1), np.uint8), iterations=1)
-    edge_layer = 255 - edges  # black lines on white background
-
-
-    # 6. Blend in edge layer
     edge_strength = float(p["edge_strength"])
     sketch = cv2.addWeighted(
-        sketch, 1.0 - edge_strength,
-        edge_layer, edge_strength,
-        0
+        sketch,
+        1.0 - edge_strength,
+        edge_layer,
+        edge_strength,
+        0,
     )
 
-
-    # 7. Blend back some original detail so faces stay readable
+    # 5. Blend back only a little original detail so faces stay readable.
     detail_blend = float(p["detail_blend"])
     if detail_blend > 0:
         sketch = cv2.addWeighted(
-            sketch, 1.0 - detail_blend,
-            gray_detail, detail_blend,
-            0
+            sketch,
+            1.0 - detail_blend,
+            gray_detail,
+            detail_blend,
+            0,
         )
 
-
-    # 8. Optional threshold if ever needed
+    # 6. Optional hard threshold.
     threshold = int(p["threshold"])
     if threshold > 0:
         _, sketch = cv2.threshold(sketch, threshold, 255, cv2.THRESH_BINARY)
 
+    # 7. Paper/noise texture.
+    texture_strength = int(p.get("paper_texture", 0))
+    if texture_strength > 0:
+        noise = np.random.normal(
+            loc=0,
+            scale=texture_strength,
+            size=sketch.shape,
+        ).astype(np.int16)
+        sketch = np.clip(sketch.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
-    # 9. Mild sharpening for final facial clarity
+    # 8. Final sharpening and print contrast.
     blurred = cv2.GaussianBlur(sketch, (0, 0), 0.8)
-    sketch = cv2.addWeighted(sketch, 1.28, blurred, -0.28, 0)
+    sketch = cv2.addWeighted(sketch, 1.45, blurred, -0.45, 0)
 
-
-    out = Image.fromarray(sketch).convert("RGB")
+    out = Image.fromarray(sketch).convert("L")
     out = ImageEnhance.Contrast(out).enhance(p["contrast"])
     out = ImageEnhance.Brightness(out).enhance(p["brightness"])
     out = ImageEnhance.Sharpness(out).enhance(p["sharpness"])
 
-
-    return out
+    return out.convert("RGB")
 
 
 # =============================================================================
@@ -673,6 +677,3 @@ if __name__ == "__main__":
         out_path = f"{base}_{key}{ext or '.png'}"
         result.save(out_path)
         print(f"  -> {out_path}")
-
-
-
