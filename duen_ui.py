@@ -126,6 +126,10 @@ class BoothUI(tk.Tk):
      self._picker_overlay    = None
      self._picker_thumb_ref  = None
      self._qr_overlay = None
+     self._auto_flash_enabled = getattr(hw, "AUTO_FLASH_ENABLED", True)
+     self._last_print_path = None
+     self._last_print_qr_path = None
+     self._last_print_had_qr = False
 
 
      self.lights = hw.LightController(hw.strip)
@@ -278,7 +282,7 @@ class BoothUI(tk.Tk):
      self.lbl_phase.pack(anchor="w", padx=12)
 
 
-     self.lbl_msg = tk.Label(parent, text="Ready. Press the hw.button.",
+     self.lbl_msg = tk.Label(parent, text="Ready. Press START.",
                              font=self.f_sans_sm, bg=SURFACE, fg=MUTED,
                              wraplength=SIDE_W - 24, justify="left")
      self.lbl_msg.pack(anchor="w", padx=12, pady=(2, 4))
@@ -313,6 +317,36 @@ class BoothUI(tk.Tk):
 
 
      tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=0, pady=6)
+
+
+     self.btn_start = tk.Button(
+        parent, text="START",
+        font=self.f_mono_lg, bg=GREEN, fg="#06140a",
+        activebackground="#5be88d", activeforeground="#06140a",
+        relief="flat", cursor="hand2", pady=12,
+        command=self._on_trigger,
+      )
+     self.btn_start.pack(fill="x", padx=12, pady=(0, 6))
+
+
+     self.btn_preview_pan = tk.Button(
+        parent, text="PREVIEW PANORAMA",
+        font=self.f_mono_md, bg=ACCENT, fg="white",
+        activebackground=ACCENT2, activeforeground="white",
+        relief="flat", cursor="hand2", pady=9,
+        command=self._on_preview_pan,
+      )
+     self.btn_preview_pan.pack(fill="x", padx=12, pady=(0, 6))
+
+
+     self.btn_customize = tk.Button(
+        parent, text="CUSTOMIZE",
+        font=self.f_mono_md, bg=SURFACE2, fg=TEXT,
+        activebackground=BORDER, activeforeground=TEXT,
+        relief="flat", cursor="hand2", pady=9,
+        command=self._toggle_customize_overlay,
+      )
+     self.btn_customize.pack(fill="x", padx=12, pady=(0, 8))
 
 
      self.btn_trigger = tk.Button(
@@ -461,7 +495,11 @@ class BoothUI(tk.Tk):
 
 
      running = phase in ("capturing", "stitching", "printing")
-     self.btn_trigger.config(state="disabled" if running else "normal")
+     control_state = "disabled" if running else "normal"
+     self.btn_trigger.config(state=control_state)
+     self.btn_start.config(state=control_state)
+     self.btn_preview_pan.config(state=control_state)
+     self.btn_customize.config(state=control_state)
 
 
      if phase == "capturing":
@@ -587,7 +625,7 @@ class BoothUI(tk.Tk):
          hw.move_servo(135)
      except Exception:
          pass
-     self.set_phase("idle", "Ready. Press the hw.button.")
+     self.set_phase("idle", "Ready. Press START.")
      self.set_feed_label("Live feed")
      self.set_last_event(f"Reset at {datetime.now().strftime('%H:%M:%S')}")
  def _toggle_capture_mode(self):
@@ -642,8 +680,14 @@ class BoothUI(tk.Tk):
         time.sleep(max(0.25, 2.0 / hw.PREVIEW_FPS_HZ))
 
 
-        # Flash the ring for the shot
-        self.lights.flash_once(brightness_fraction=1.0, duration_s=0.15)
+        # Auto flash checks darkness before the shot.
+        auto_flash_was_on = self._prepare_auto_flash()
+
+        # If auto flash did not trigger, still do a quick normal flash.
+        # If auto flash triggered, keep the ring on steadily during capture.
+        if not auto_flash_was_on:
+            self.lights.set_brightness(180)
+            self.lights.flash_once(brightness_fraction=1.0, duration_s=0.15)
 
 
         # Save to ~/photos with a timestamp filename
@@ -653,7 +697,11 @@ class BoothUI(tk.Tk):
 
 
         # Reuse take_picture logic � pass dummy angle/index
-        hw.take_still_photo(filepath)
+        try:
+            hw.take_still_photo(filepath)
+        finally:
+            self._restore_auto_flash(auto_flash_was_on)
+
         filepath = self._apply_selected_filter_to_output(filepath)
         result = filepath
 
@@ -734,12 +782,18 @@ class BoothUI(tk.Tk):
              time.sleep(max(0.25, 2.0 / hw.PREVIEW_FPS_HZ))
 
 
-             self.lights.flash_once(brightness_fraction=1.0, duration_s=0.15)
+             auto_flash_was_on = self._prepare_auto_flash()
+             if not auto_flash_was_on:
+                 self.lights.set_brightness(180)
+                 self.lights.flash_once(brightness_fraction=1.0, duration_s=0.15)
 
 
              filepath = os.path.join(
                  hw.SAVE_DIR, f"multi_{timestamp_base}_{shot_num}.jpg")
-             hw.take_still_photo(filepath)
+             try:
+                 hw.take_still_photo(filepath)
+             finally:
+                 self._restore_auto_flash(auto_flash_was_on)
              captured_paths.append(filepath)
 
 
@@ -850,12 +904,18 @@ class BoothUI(tk.Tk):
              ui(self.set_phase, "capturing",
                 f"Taking photo {shot_num} of {NUM_SHOTS}...", shot_num - 1)
              time.sleep(max(0.25, 2.0 / hw.PREVIEW_FPS_HZ))
-             self.lights.flash_once(brightness_fraction=1.0, duration_s=0.15)
+             auto_flash_was_on = self._prepare_auto_flash()
+             if not auto_flash_was_on:
+                 self.lights.set_brightness(180)
+                 self.lights.flash_once(brightness_fraction=1.0, duration_s=0.15)
 
 
              filepath = os.path.join(
                  hw.SAVE_DIR, f"multi_{timestamp_base}_{shot_num}.jpg")
-             hw.take_still_photo(filepath)
+             try:
+                 hw.take_still_photo(filepath)
+             finally:
+                 self._restore_auto_flash(auto_flash_was_on)
              captured_paths.append(filepath)
 
 
@@ -1113,6 +1173,37 @@ class BoothUI(tk.Tk):
      self._btn_exp_manual.pack(side="left")
 
 
+     # ── Auto flash mode ────────────────────────────────────────────────
+     tk.Frame(light_col, bg=BORDER, height=1).pack(fill="x", pady=(14, 8))
+     tk.Label(light_col, text="AUTO FLASH", font=self.f_mono_md,
+              bg=BG, fg=ACCENT2).pack(anchor="w")
+     tk.Label(
+         light_col,
+         text="If the camera sees a dark scene, the ring light turns on before capture.",
+         font=self.f_sans_sm, bg=BG, fg=MUTED, justify="left", wraplength=290,
+     ).pack(anchor="w", pady=(2, 6))
+     flash_row = tk.Frame(light_col, bg=BG)
+     flash_row.pack(anchor="w")
+     self._btn_flash_on = tk.Button(
+         flash_row, text="ON", font=self.f_mono_sm,
+         bg=ACCENT if self._auto_flash_enabled else SURFACE2,
+         fg="white" if self._auto_flash_enabled else TEXT,
+         activebackground=ACCENT2, activeforeground="white",
+         relief="flat", cursor="hand2", width=10, pady=8,
+         command=lambda: self._set_auto_flash_mode(True),
+     )
+     self._btn_flash_on.pack(side="left", padx=(0, 4))
+     self._btn_flash_off = tk.Button(
+         flash_row, text="OFF", font=self.f_mono_sm,
+         bg=ACCENT if not self._auto_flash_enabled else SURFACE2,
+         fg="white" if not self._auto_flash_enabled else TEXT,
+         activebackground=ACCENT2, activeforeground="white",
+         relief="flat", cursor="hand2", width=10, pady=8,
+         command=lambda: self._set_auto_flash_mode(False),
+     )
+     self._btn_flash_off.pack(side="left")
+
+
  def _show_touch_keyboard(self, entry, text_var):
      """Simple built-in touch keyboard for the event title Entry."""
      self._touch_keyboard_entry = entry
@@ -1339,6 +1430,77 @@ class BoothUI(tk.Tk):
      print(f"[exposure] {'AUTO' if auto else 'MANUAL'}")
 
 
+
+ def _set_auto_flash_mode(self, enabled):
+     """Toggle auto flash from the customize screen."""
+     self._auto_flash_enabled = bool(enabled)
+     try:
+         hw.AUTO_FLASH_ENABLED = self._auto_flash_enabled
+     except Exception:
+         pass
+
+     if hasattr(self, "_btn_flash_on"):
+         self._btn_flash_on.config(
+             bg=ACCENT if self._auto_flash_enabled else SURFACE2,
+             fg="white" if self._auto_flash_enabled else TEXT,
+         )
+     if hasattr(self, "_btn_flash_off"):
+         self._btn_flash_off.config(
+             bg=ACCENT if not self._auto_flash_enabled else SURFACE2,
+             fg="white" if not self._auto_flash_enabled else TEXT,
+         )
+
+
+ def _prepare_auto_flash(self):
+     """
+     Turn the ring light on only if the camera sees a dark scene.
+
+     Returns True if auto flash turned the light on, False otherwise.
+     """
+     try:
+         if not self._auto_flash_enabled:
+             return False
+         if not getattr(hw, "AUTO_FLASH_ENABLED", True):
+             return False
+
+         is_dark, brightness = hw.scene_is_dark()
+         if not is_dark:
+             print(f"[auto flash] not needed, brightness={brightness:.1f}")
+             return False
+
+         print(f"[auto flash] dark scene detected, brightness={brightness:.1f}")
+         self.lights.set_mode(self.light_mode)
+         self.lights.set_brightness(getattr(hw, "AUTO_FLASH_BRIGHTNESS", 220))
+         time.sleep(getattr(hw, "AUTO_FLASH_SETTLE_S", 0.45))
+         return True
+
+     except Exception as e:
+         print(f"[auto flash] failed: {e}")
+         return False
+
+
+ def _restore_auto_flash(self, auto_flash_was_on):
+     """Turn the ring back off after auto flash capture."""
+     if not auto_flash_was_on:
+         return
+     try:
+         self.lights.set_brightness(0)
+     except Exception as e:
+         print(f"[auto flash] restore failed: {e}")
+
+
+ def _remember_last_print(self, image_path, qr_path=None):
+     """
+     Save the exact image and optional QR that was sent to the printer.
+     Used by REPRINT LAST when receipt paper runs out halfway.
+     """
+     if image_path and os.path.exists(image_path):
+         self._last_print_path = image_path
+         self._last_print_qr_path = qr_path if qr_path and os.path.exists(qr_path) else None
+         self._last_print_had_qr = self._last_print_qr_path is not None
+         print(f"[reprint] saved last print: {self._last_print_path}")
+
+
  # Ã¢â€â‚¬Ã¢â€â‚¬ Print picker overlay Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
  def _show_print_picker(self, image_path):
      self.pending_copies = hw.DEFAULT_PRINTS
@@ -1412,6 +1574,13 @@ class BoothUI(tk.Tk):
          activebackground=BORDER, activeforeground=TEXT,
          relief="flat", cursor="hand2", pady=10, padx=12,
          command=self._on_print_confirmed,
+     ).pack(side="left", padx=4)
+     tk.Button(
+         act_row, text="REPRINT LAST",
+         font=self.f_mono_md, bg=SURFACE2, fg=TEXT,
+         activebackground=BORDER, activeforeground=TEXT,
+         relief="flat", cursor="hand2", pady=10, padx=12,
+         command=self._on_reprint_last,
      ).pack(side="left", padx=4)
      tk.Button(
          act_row, text="SKIP",
@@ -1491,6 +1660,7 @@ class BoothUI(tk.Tk):
          copies = self.pending_copies
          for i in range(copies):
              ui(self.set_phase, "printing", f"Printing {i+1} / {copies}...")
+             self._remember_last_print(image_path)
              hw.process_and_print(image_path)
              self.print_session += 1
              self.print_total   += 1
@@ -1550,6 +1720,7 @@ class BoothUI(tk.Tk):
          copies = self.pending_copies
          for i in range(copies):
              ui(self.set_phase, "printing", f"Printing {i+1} / {copies}...")
+             self._remember_last_print(image_path, qr_path=result["qr_path"])
              hw.process_and_print(image_path, qr_path=result["qr_path"])
              self.print_session += 1
              self.print_total   += 1
@@ -1618,6 +1789,54 @@ class BoothUI(tk.Tk):
      self.set_feed_label("Live feed")
 
 
+
+ def _on_reprint_last(self):
+     """Reprint the last saved output without retaking photos."""
+     if self._is_running:
+         return
+
+     image_path = self._last_print_path or getattr(self, "_pending_output", None)
+     if not image_path or not os.path.exists(image_path):
+         self.set_phase("error", "No previous print found to reprint.")
+         return
+
+     self._close_print_picker()
+     threading.Thread(
+         target=self._run_reprint_last,
+         args=(image_path, self._last_print_qr_path),
+         daemon=True,
+     ).start()
+
+
+ def _run_reprint_last(self, image_path, qr_path=None):
+     self._is_running = True
+
+     def ui(fn, *a, **kw):
+         self.after(0, lambda: fn(*a, **kw))
+
+     try:
+         ui(self.set_phase, "printing", "Reprinting last receipt...")
+
+         if qr_path and os.path.exists(qr_path):
+             hw.process_and_print(image_path, qr_path=qr_path)
+         else:
+             hw.process_and_print(image_path)
+
+         self.print_session += 1
+         self.print_total += 1
+         hw.save_print_total(self.print_total)
+         ui(self._refresh_counters)
+
+         ui(self.set_phase, "done", "Reprint complete.")
+         ui(self.set_last_event, f"Reprinted: {datetime.now().strftime('%H:%M:%S')}")
+
+     except Exception as e:
+         ui(self.set_phase, "error", f"Reprint failed: {e}")
+
+     finally:
+         self._is_running = False
+
+
  def _on_print_confirmed(self):
      self._close_print_picker()
      threading.Thread(target=self._run_print_only, daemon=True).start()
@@ -1626,7 +1845,7 @@ class BoothUI(tk.Tk):
  def _on_print_skip(self):
     self._close_print_picker()
     self._latest_still_pil = None
-    self.set_phase("idle", "Ready. Press the hw.button.")
+    self.set_phase("idle", "Ready. Press START.")
     self.set_feed_label("Live feed")
 
 
@@ -1642,7 +1861,9 @@ class BoothUI(tk.Tk):
      try:
          for i in range(copies):
             ui(self.set_phase, "printing", f"Printing {i+1} / {copies}...")
-            hw.process_and_print(getattr(self, "_pending_output", hw.STITCHED_OUTPUT))
+            image_path = getattr(self, "_pending_output", hw.STITCHED_OUTPUT)
+            self._remember_last_print(image_path)
+            hw.process_and_print(image_path)
             self.print_session += 1
             self.print_total   += 1
             hw.save_print_total(self.print_total)
@@ -1791,6 +2012,7 @@ class BoothUI(tk.Tk):
          return
      self._stop_requested = False
      self._is_running = True
+     auto_flash_was_on = False
 
 
      def ui(fn, *a, **kw):
@@ -1855,12 +2077,18 @@ class BoothUI(tk.Tk):
          ui(self.set_phase, "capturing", "Starting Perfect Stitch capture...", 0)
 
 
+         # For panorama, use steady auto flash for the full sweep.
+         # Do not flash each frame, because changing light between frames can hurt stitching.
+         auto_flash_was_on = self._prepare_auto_flash()
+
          output = hw.capture_and_stitch_once(
              progress_callback=progress,
              image_callback=show_capture,
              stop_flag=lambda: self._stop_requested,
          )
 
+
+         self._restore_auto_flash(auto_flash_was_on)
 
          if output and os.path.exists(output) and not self._stop_requested:
              ui(self.set_phase, "stitching", "Applying selected filter...")
@@ -1890,6 +2118,10 @@ class BoothUI(tk.Tk):
          ui(self._hide_loading_overlay)
          ui(self.set_phase, "error", f"Error: {e}")
      finally:
+         try:
+             self._restore_auto_flash(auto_flash_was_on)
+         except Exception:
+             pass
          self._preview_active  = True
          self._countdown_value = None
          self._is_running      = False
@@ -1907,8 +2139,3 @@ if __name__ == "__main__":
              cleanup()
          except Exception:
              pass
-
-
-
-
-
